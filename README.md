@@ -2,6 +2,8 @@
 
 Minimalistischer Desktop-Musikplayer mit PySide6 (Qt 6) im Stil von Apple Music/Spotify. Fokus auf FLAC-Bibliotheken, liest aber auch MP3, OGG, WAV, M4A und AAC.
 
+![FloPlayer Screenshot](screenshot.png)
+
 ## Features
 
 - Bibliotheksordner einlesen, inkl. Tags und Cover (über `mutagen`)
