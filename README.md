@@ -1,11 +1,19 @@
-# Music Player
+# FloPlayer
 
-Basic Desktop-Player mit PySide6 (Qt 6). Spielt FLAC, MP3, OGG, WAV, M4A und AAC ab.
+Minimalistischer Desktop-Musikplayer mit PySide6 (Qt 6) im Stil von Apple Music/Spotify. Fokus auf FLAC-Bibliotheken, liest aber auch MP3, OGG, WAV, M4A und AAC.
+
+## Features
+
+- Bibliotheksordner einlesen, inkl. Tags und Cover (über `mutagen`)
+- Gruppieren/Sortieren nach Interpret, Album, Jahr oder Titel
+- Live-Suche über Titel, Interpret und Album
+- Qualitäts-Badge in der Playerleiste (leuchtendes "FLAC"-Badge bzw. MP3-Bitrate)
+- Wiederholen: aus / ganze Bibliothek / aktueller Titel
+- Merkt sich die zuletzt geöffnete Bibliothek
 
 ## Einrichtung
 
 ```bash
-cd music-player
 python -m venv .venv
 
 # Windows:
@@ -21,10 +29,3 @@ pip install -r requirements.txt
 ```bash
 python main.py
 ```
-
-## Geplant
-
-- Metadaten (Titel, Künstler, Cover) mit `mutagen`
-- Ordnerbibliothek mit Playlist und SQLite
-- Discord Rich Presence über `pypresence`
-- Media-Keys und Tray-Icon

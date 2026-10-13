@@ -477,7 +477,7 @@ def scan_library(folder: str) -> list:
 class PlayerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Mini Player")
+        self.setWindowTitle("FloPlayer")
         self.resize(1000, 640)
 
         # Audio-Pipeline: QMediaPlayer -> QAudioOutput
@@ -498,7 +498,7 @@ class PlayerWindow(QMainWindow):
         self.group_by = GROUP_OPTIONS[0][1]
         self.repeat_mode = "off"  # "off", "all" (Bibliothek) oder "one" (aktueller Titel)
 
-        self.settings = QSettings("MiniPlayer", "MiniPlayer")
+        self.settings = QSettings("FloPlayer", "FloPlayer")
 
         self._build_ui()
         self._connect_signals()
@@ -956,7 +956,7 @@ class PlayerWindow(QMainWindow):
             cover_data = read_track(path)["cover_data"] if path.lower().endswith(".flac") else None
         self.now_playing_title.setText(title)
         self.now_playing_artist.setText(artist)
-        self.setWindowTitle(f"{title} – Mini Player")
+        self.setWindowTitle(f"{title} – FloPlayer")
         self._set_cover_art(cover_data)
         self._set_quality_badge(path)
         self.player.play()
