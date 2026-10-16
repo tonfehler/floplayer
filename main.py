@@ -1,21 +1,28 @@
+import math
 import os
 import re
 import sys
+import time
 
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
+from pypresence import ActivityType, Presence
 from PySide6.QtCore import Qt, QUrl, QFileInfo, QSize, QPointF, QRectF, QSettings
 from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QPolygonF, QAction, QActionGroup
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QFileDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QLineEdit,
-    QGraphicsDropShadowEffect, QToolButton, QMenu,
+    QGraphicsDropShadowEffect, QToolButton, QMenu, QDialog, QCheckBox,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 COVER_SIZE = 48
 PLAYER_COVER_SIZE = 56
+
+# Key des in Discord hochgeladenen Rich-Presence-Art-Assets (icon.png)
+DISCORD_LARGE_IMAGE_KEY = "icon"
+GITHUB_URL = "https://github.com/tonfehler/floplayer"
 
 # Dunkles Farbschema im Stil von Apple Music / Spotify, Akzent in Hellblau statt Grün
 BG = "#1c1c1e"
@@ -28,7 +35,7 @@ ACCENT = "#4FC3F7"
 ACCENT_HOVER = "#7AD6FA"
 
 STYLE_SHEET = f"""
-QMainWindow, QWidget#centralWidget {{
+QMainWindow, QWidget#centralWidget, QDialog {{
     background-color: {BG};
 }}
 QLabel {{
@@ -37,6 +44,20 @@ QLabel {{
 QLabel#secondaryLabel {{
     color: {TEXT_SECONDARY};
     font-size: 9pt;
+}}
+QCheckBox {{
+    color: {TEXT_PRIMARY};
+    spacing: 8px;
+}}
+QLineEdit {{
+    background-color: {ELEVATED};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 5px 10px;
+}}
+QLineEdit:focus {{
+    border: 1px solid {ACCENT};
 }}
 QPushButton {{
     background-color: transparent;
@@ -362,6 +383,35 @@ def make_sort_icon(color: str, size: int = 18) -> QPixmap:
     return pixmap
 
 
+def make_gear_icon(color: str, size: int = 18) -> QPixmap:
+    """Minimalistisches Zahnrad-Icon für den Einstellungen-Button."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(color))
+    pen.setWidthF(1.4)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    center = QPointF(size / 2, size / 2)
+    radius = 3.6
+    painter.drawEllipse(center, radius, radius)
+
+    for i in range(8):
+        angle = math.radians(i * 45)
+        x1 = center.x() + math.cos(angle) * (radius + 0.8)
+        y1 = center.y() + math.sin(angle) * (radius + 0.8)
+        x2 = center.x() + math.cos(angle) * (radius + 2.8)
+        y2 = center.y() + math.sin(angle) * (radius + 2.8)
+        painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+    painter.end()
+    return pixmap
+
+
 def make_repeat_icon(color: str, mode: str = "off", size: int = 18) -> QPixmap:
     """Loop-Icon (kreisender Pfeil); bei mode='one' zusätzlich mit kleiner '1'."""
     pixmap = QPixmap(size, size)
@@ -498,6 +548,10 @@ class PlayerWindow(QMainWindow):
         self.group_by = GROUP_OPTIONS[0][1]
         self.repeat_mode = "off"  # "off", "all" (Bibliothek) oder "one" (aktueller Titel)
 
+        self.discord_enabled = False
+        self.discord_client_id = ""
+        self.discord_presence = None
+
         self.settings = QSettings("FloPlayer", "FloPlayer")
 
         self._build_ui()
@@ -505,6 +559,7 @@ class PlayerWindow(QMainWindow):
         self._update_controls()
         self._update_repeat_button()
         self._restore_last_library()
+        self._restore_discord_settings()
 
     # ---------- UI aufbauen ----------
 
@@ -558,6 +613,13 @@ class PlayerWindow(QMainWindow):
         self.sort_button.setMenu(self._build_sort_menu())
         toolbar.addWidget(self.sort_button)
 
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("iconButton")
+        self.settings_button.setIcon(QIcon(make_gear_icon(TEXT_PRIMARY)))
+        self.settings_button.setIconSize(QSize(18, 18))
+        self.settings_button.setToolTip("Einstellungen")
+        toolbar.addWidget(self.settings_button)
+
         content_layout.addLayout(toolbar)
 
         self.playlist_table = QTableWidget(0, 5)
@@ -603,6 +665,145 @@ class PlayerWindow(QMainWindow):
     def _update_sort_tooltip(self):
         label = next((text for text, key in GROUP_OPTIONS if key == self.group_by), "")
         self.sort_button.setToolTip(f"Sortieren nach: {label}")
+
+    # ---------- Einstellungen / Discord Rich Presence ----------
+
+    def _open_settings_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Einstellungen")
+        dialog.setStyleSheet(STYLE_SHEET)
+        dialog.setMinimumWidth(380)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        checkbox = QCheckBox("Discord Rich Presence aktivieren")
+        checkbox.setChecked(self.discord_enabled)
+        layout.addWidget(checkbox)
+
+        id_row = QHBoxLayout()
+        id_row.addWidget(QLabel("Discord Client ID:"))
+        client_id_edit = QLineEdit(self.discord_client_id)
+        client_id_edit.setPlaceholderText("z.B. 123456789012345678")
+        id_row.addWidget(client_id_edit, stretch=1)
+        layout.addLayout(id_row)
+
+        status_label = QLabel("")
+        status_label.setObjectName("secondaryLabel")
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        hint = QLabel(
+            "Eigene Anwendung unter discord.com/developers/applications anlegen "
+            "und die Client ID hier eintragen. Discord muss lokal laufen, damit "
+            "die Verbindung klappt."
+        )
+        hint.setObjectName("secondaryLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        def apply_state():
+            self.discord_client_id = client_id_edit.text().strip()
+            self.settings.setValue("discord/client_id", self.discord_client_id)
+            if checkbox.isChecked():
+                error = self._enable_discord_presence()
+                status_label.setText(error or "Verbunden.")
+            else:
+                self._disable_discord_presence()
+                status_label.setText("Deaktiviert.")
+
+        checkbox.toggled.connect(lambda _checked: apply_state())
+        client_id_edit.editingFinished.connect(apply_state)
+
+        close_button = QPushButton("Schließen")
+        close_button.setObjectName("openButton")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button, alignment=Qt.AlignRight)
+
+        dialog.exec()
+
+    def _restore_discord_settings(self):
+        self.discord_client_id = str(self.settings.value("discord/client_id", "") or "")
+        enabled = self.settings.value("discord/enabled", False)
+        enabled = str(enabled).lower() in ("1", "true", "yes")
+        if enabled:
+            self._enable_discord_presence()
+
+    def _enable_discord_presence(self):
+        """Aktiviert Discord-RPC und versucht zu verbinden. Gibt Fehlermeldung zurück oder None bei Erfolg."""
+        self.discord_enabled = True
+        self.settings.setValue("discord/enabled", True)
+        self._disconnect_discord()
+
+        if not self.discord_client_id:
+            return "Keine Client ID eingetragen."
+
+        try:
+            presence = Presence(self.discord_client_id)
+            presence.connect()
+        except Exception as exc:
+            self.discord_presence = None
+            return f"Verbindung fehlgeschlagen: {exc}"
+
+        self.discord_presence = presence
+        self._update_discord_presence()
+        return None
+
+    def _disable_discord_presence(self):
+        self.discord_enabled = False
+        self.settings.setValue("discord/enabled", False)
+        self._disconnect_discord()
+
+    def _disconnect_discord(self):
+        if self.discord_presence is not None:
+            try:
+                self.discord_presence.close()
+            except Exception:
+                pass
+            self.discord_presence = None
+
+    def _update_discord_presence(self):
+        if not self.discord_enabled or self.discord_presence is None:
+            return
+
+        if self.player.source().isEmpty():
+            try:
+                self.discord_presence.clear()
+            except Exception:
+                self.discord_presence = None
+            return
+
+        title = self.now_playing_title.text()
+        artist = self.now_playing_artist.text()
+        playing = self.player.playbackState() == QMediaPlayer.PlayingState
+
+        try:
+            if playing:
+                start_epoch = int(time.time() - self.player.position() / 1000)
+                self.discord_presence.update(
+                    details=title,
+                    state=artist or "FloPlayer",
+                    start=start_epoch,
+                    large_image=DISCORD_LARGE_IMAGE_KEY,
+                    large_text="FloPlayer",
+                    activity_type=ActivityType.LISTENING,
+                    buttons=[{"label": "GitHub", "url": GITHUB_URL}],
+                )
+            else:
+                state = f"Pausiert – {artist}" if artist else "Pausiert"
+                self.discord_presence.update(
+                    details=title,
+                    state=state,
+                    large_image=DISCORD_LARGE_IMAGE_KEY,
+                    large_text="FloPlayer",
+                    activity_type=ActivityType.LISTENING,
+                    buttons=[{"label": "GitHub", "url": GITHUB_URL}],
+                )
+        except Exception:
+            self.discord_presence = None
+
+    def closeEvent(self, event):
+        self._disconnect_discord()
+        super().closeEvent(event)
 
     def _build_player_bar(self):
         player_bar = QWidget()
@@ -710,6 +911,7 @@ class PlayerWindow(QMainWindow):
 
     def _connect_signals(self):
         self.library_button.clicked.connect(self.choose_library)
+        self.settings_button.clicked.connect(self._open_settings_dialog)
         self.search_edit.textChanged.connect(self._on_search_changed)
         self.playlist_table.cellDoubleClicked.connect(self._on_table_double_clicked)
 
@@ -727,6 +929,7 @@ class PlayerWindow(QMainWindow):
         self.player.positionChanged.connect(self.on_position_changed)
         self.player.durationChanged.connect(self.on_duration_changed)
         self.player.playbackStateChanged.connect(self._update_controls)
+        self.player.playbackStateChanged.connect(lambda _state: self._update_discord_presence())
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.player.errorOccurred.connect(self.on_error)
 

@@ -1,2 +1,3 @@
 PySide6>=6.6
 mutagen>=1.47
+pypresence>=4.3
