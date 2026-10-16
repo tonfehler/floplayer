@@ -1,2 +1,5 @@
 .claude/
 .venv/
+build/
+dist/
+main.spec
