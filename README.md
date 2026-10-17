@@ -31,3 +31,7 @@ pip install -r requirements.txt
 ```bash
 python main.py
 ```
+
+## Lizenz
+
+GPL-3.0 (siehe [LICENSE.md](LICENSE.md)) — bedingt durch die Verwendung von [`mutagen`](https://github.com/quodlibet/mutagen) (GPL-2.0-or-later) und [`PySide6`](https://pyside.org) (LGPL-3.0/GPL).
