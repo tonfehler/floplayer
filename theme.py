@@ -114,18 +114,18 @@ QLineEdit#searchEdit {{
 QLineEdit#searchEdit:focus {{
     border: 1px solid {ACCENT};
 }}
-QTableWidget {{
+QTableView {{
     background-color: {BG};
     alternate-background-color: #242426;
     gridline-color: transparent;
     border: none;
     color: {TEXT_PRIMARY};
 }}
-QTableWidget::item {{
+QTableView::item {{
     padding: 4px;
     border: none;
 }}
-QTableWidget::item:selected {{
+QTableView::item:selected {{
     background-color: #1c323c;
     color: {ACCENT};
 }}

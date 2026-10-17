@@ -1,11 +1,15 @@
 """Einlesen von FLAC-Bibliotheken: Tags, Cover, Qualitätsinfo, Sortierung/Gruppierung/Suche."""
 
+import hashlib
 import os
 import re
 
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
-from PySide6.QtCore import QFileInfo
+from PySide6.QtCore import QBuffer, QByteArray, QFileInfo, QIODevice, Qt
+from PySide6.QtGui import QImage
+
+from theme import PLAYER_COVER_SIZE
 
 # (Anzeigetext, interner Schlüssel) für die Gruppierungs-/Sortierauswahl
 GROUP_OPTIONS = [
@@ -14,6 +18,9 @@ GROUP_OPTIONS = [
     ("Jahr", "year"),
     ("Titel (ohne Gruppierung)", "title"),
 ]
+
+# Cover werden nur als kleine Vorschaubilder im Speicher/Cache gehalten (2x für HiDPI)
+THUMBNAIL_SIZE = PLAYER_COVER_SIZE * 2
 
 
 def sort_key_for_group(group_by):
@@ -27,15 +34,8 @@ def sort_key_for_group(group_by):
 
 
 def track_matches_search(track, query):
-    """True, wenn Titel, Interpret oder Album den Suchbegriff enthält (case-insensitive)."""
-    if not query:
-        return True
-    query = query.lower()
-    return (
-        query in track["title"].lower()
-        or query in track["artist"].lower()
-        or query in track["album"].lower()
-    )
+    """True, wenn Titel, Interpret oder Album den (bereits kleingeschriebenen) Suchbegriff enthält."""
+    return not query or query in track["search_text"]
 
 
 def group_label(track, group_by):
@@ -75,18 +75,49 @@ def select_cover(pictures):
     return pictures[0].data
 
 
-def read_track(path: str) -> dict:
-    """Pfad + FLAC-Tags in ein Track-Dict umwandeln. Fällt auf den Dateinamen zurück."""
+def cover_id_for(data: bytes) -> str:
+    """Inhalts-Hash als ID, damit identische Cover (z.B. eines Albums) nur einmal vorliegen."""
+    return hashlib.sha1(data).hexdigest()
+
+
+def make_thumbnail(data: bytes):
+    """Cover auf THUMBNAIL_SIZE verkleinern und als JPEG-Bytes zurückgeben (None bei Fehler)."""
+    image = QImage.fromData(data)
+    if image.isNull():
+        return None
+    image = image.scaled(THUMBNAIL_SIZE, THUMBNAIL_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    buffer = QByteArray()
+    device = QBuffer(buffer)
+    device.open(QIODevice.WriteOnly)
+    if not image.convertToFormat(QImage.Format_RGB32).save(device, "JPEG", 90):
+        return None
+    return bytes(buffer.data())
+
+
+def finalize_track(track: dict) -> dict:
+    """Abgeleitete Felder ergänzen, die nicht gespeichert werden müssen."""
+    track["search_text"] = "\n".join((track["title"], track["artist"], track["album"])).lower()
+    return track
+
+
+def read_track(path: str, covers: dict) -> dict:
+    """Pfad + FLAC-Tags in ein Track-Dict umwandeln. Fällt auf den Dateinamen zurück.
+
+    Das Cover landet (einmal pro Inhalt) als Vorschaubild in `covers` (ID -> JPEG-Bytes),
+    der Track verweist nur per `cover_id` darauf.
+    """
     title = QFileInfo(path).completeBaseName()
     artist = ""
     album = ""
     track_no = 0
     year = 0
     duration_ms = 0
-    cover_data = None
+    cover_id = None
+    badge = None
 
     try:
         audio = FLAC(path)
+        badge = ("flac", "FLAC")
         title = (audio.get("title", [title])[0] or title)
         artist = (audio.get("artist", [""])[0] or "")
         album = (audio.get("album", [""])[0] or "")
@@ -98,10 +129,17 @@ def read_track(path: str) -> dict:
         if audio.info is not None:
             duration_ms = int(audio.info.length * 1000)
         cover_data = select_cover(audio.pictures)
+        if cover_data:
+            cover_id = cover_id_for(cover_data)
+            # Bei parallelem Einlesen wird ein Cover schlimmstenfalls doppelt verkleinert
+            if cover_id not in covers:
+                covers[cover_id] = make_thumbnail(cover_data)
+            if covers[cover_id] is None:
+                cover_id = None
     except Exception:
         pass
 
-    return {
+    return finalize_track({
         "path": path,
         "title": title,
         "artist": artist,
@@ -109,13 +147,14 @@ def read_track(path: str) -> dict:
         "track_no": track_no,
         "year": year,
         "duration_ms": duration_ms,
-        "cover_data": cover_data,
-    }
+        "cover_id": cover_id,
+        "badge": badge,
+    })
 
 
-def scan_library(folder: str) -> list:
-    """Verzeichnis rekursiv nach FLAC-Dateien durchsuchen und Tags lesen."""
-    tracks = []
+def find_library_files(folder: str) -> list:
+    """Verzeichnis rekursiv nach FLAC-Dateien durchsuchen."""
+    paths = []
     for root, dirs, files in os.walk(folder):
         # Versteckte Ordner (z.B. .Trash, Cloud-Sync-Metadaten) überspringen
         dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -124,6 +163,5 @@ def scan_library(folder: str) -> list:
             if name.startswith("."):
                 continue
             if name.lower().endswith(".flac"):
-                tracks.append(read_track(os.path.join(root, name)))
-    tracks.sort(key=lambda t: (t["artist"].lower(), t["album"].lower(), t["track_no"]))
-    return tracks
+                paths.append(os.path.join(root, name))
+    return paths

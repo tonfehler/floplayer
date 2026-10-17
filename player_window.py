@@ -2,12 +2,12 @@
 
 import os
 
-from PySide6.QtCore import Qt, QUrl, QFileInfo, QSize, QSettings
+from PySide6.QtCore import Qt, QUrl, QFileInfo, QSize, QSettings, QStandardPaths, QTimer
 from PySide6.QtGui import QIcon, QPixmap, QColor, QAction, QActionGroup
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QSlider, QFileDialog, QTableWidget,
-    QTableWidgetItem, QHeaderView, QAbstractItemView, QLineEdit,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QSlider, QFileDialog, QTableView,
+    QHeaderView, QAbstractItemView, QLineEdit,
     QGraphicsDropShadowEffect, QToolButton, QMenu,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -19,8 +19,10 @@ from icons import (
 )
 from library import (
     GROUP_OPTIONS, group_label, quality_badge_info, read_track,
-    scan_library, sort_key_for_group, track_matches_search,
+    sort_key_for_group, track_matches_search,
 )
+from library_model import LibraryTableModel
+from library_scanner import LibraryScanner
 from settings_dialog import SettingsDialog
 from theme import ACCENT, COVER_SIZE, ELEVATED, PLAYER_COVER_SIZE, STYLE_SHEET, TEXT_PRIMARY, TEXT_SECONDARY
 from utils import format_ms
@@ -42,13 +44,23 @@ class PlayerWindow(QMainWindow):
         self._seeking = False
 
         self.tracks = []
+        # Cover-ID -> JPEG-Vorschaubild; daraus erzeugte Pixmaps/Icons werden gecacht
+        self.covers = {}
+        self._cover_pixmaps = {}
+        self._cover_icons = {}
         self.current_index = -1
-        # Zuordnung Tabellenzeile -> Track-Index (None für Gruppen-Überschriften)
-        self.row_to_track = []
+        # Zuordnung Track-Index -> Tabellenzeile (nur für aktuell sichtbare Tracks)
         self.track_to_row = {}
         self.search_query = ""
         self.group_by = GROUP_OPTIONS[0][1]
         self.repeat_mode = "off"  # "off", "all" (Bibliothek) oder "one" (aktueller Titel)
+        self._scanner = None
+        self._last_position_s = -1
+
+        # Suche erst filtern, wenn kurz nicht mehr getippt wurde
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
 
         self.settings = QSettings("FloPlayer", "FloPlayer")
         self.discord = DiscordPresenceManager(self.settings)
@@ -121,16 +133,22 @@ class PlayerWindow(QMainWindow):
 
         content_layout.addLayout(toolbar)
 
-        self.playlist_table = QTableWidget(0, 5)
-        self.playlist_table.setHorizontalHeaderLabels(["", "Titel", "Interpret", "Album", "Jahr"])
+        self.playlist_model = LibraryTableModel(self._cover_icon, self)
+        self.playlist_table = QTableView()
+        self.playlist_table.setModel(self.playlist_model)
         self.playlist_table.setIconSize(QSize(COVER_SIZE, COVER_SIZE))
+        self.playlist_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.playlist_table.verticalHeader().setDefaultSectionSize(COVER_SIZE + 4)
         self.playlist_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.playlist_table.setColumnWidth(0, COVER_SIZE + 8)
         self.playlist_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.playlist_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.playlist_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.playlist_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        # Feste Breite statt ResizeToContents, das bei jedem Neuaufbau alle Zeilen vermessen würde
+        self.playlist_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
+        self.playlist_table.setColumnWidth(
+            4, self.playlist_table.fontMetrics().horizontalAdvance("00000") + 24
+        )
         self.playlist_table.verticalHeader().setVisible(False)
         self.playlist_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.playlist_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -172,6 +190,9 @@ class PlayerWindow(QMainWindow):
         dialog.exec()
 
     def closeEvent(self, event):
+        if self._scanner is not None:
+            self._scanner.requestInterruption()
+            self._scanner.wait()
         self.discord.disconnect()
         super().closeEvent(event)
 
@@ -282,8 +303,9 @@ class PlayerWindow(QMainWindow):
     def _connect_signals(self):
         self.library_button.clicked.connect(self.choose_library)
         self.settings_button.clicked.connect(self._open_settings_dialog)
-        self.search_edit.textChanged.connect(self._on_search_changed)
-        self.playlist_table.cellDoubleClicked.connect(self._on_table_double_clicked)
+        self.search_edit.textChanged.connect(lambda _text: self._search_timer.start())
+        self._search_timer.timeout.connect(self._on_search_changed)
+        self.playlist_table.doubleClicked.connect(self._on_table_double_clicked)
 
         self.open_button.clicked.connect(self.open_file)
         self.play_button.clicked.connect(self.toggle_play)
@@ -321,20 +343,46 @@ class PlayerWindow(QMainWindow):
             self._load_library_folder(folder)
 
     def _load_library_folder(self, folder: str):
-        self.search_query = ""
-        self.search_edit.clear()
+        if self._scanner is not None:
+            return
         self.library_button.setEnabled(False)
         self.library_button.setToolTip("Lese Bibliothek…")
-        QApplication.processEvents()
-        try:
-            self.tracks = scan_library(folder)
-        finally:
-            self.library_button.setEnabled(True)
-            self.library_button.setToolTip("Bibliothek wählen…")
+        self.search_edit.setPlaceholderText("Lese Bibliothek…")
 
+        cache_dir = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        os.makedirs(cache_dir, exist_ok=True)
+        self._scanner = LibraryScanner(folder, os.path.join(cache_dir, "library.sqlite3"), self)
+        self._scanner.progress.connect(self._on_scan_progress)
+        self._scanner.scanned.connect(
+            lambda tracks, covers: self._on_library_scanned(folder, tracks, covers)
+        )
+        self._scanner.finished.connect(self._on_scanner_finished)
+        self._scanner.start()
+
+    def _on_scan_progress(self, done: int, total: int):
+        self.search_edit.setPlaceholderText(f"Lese Bibliothek… {done}/{total}")
+
+    def _on_library_scanned(self, folder: str, tracks: list, covers: dict):
+        self.search_query = ""
+        self.search_edit.blockSignals(True)
+        self.search_edit.clear()
+        self.search_edit.blockSignals(False)
+        self._search_timer.stop()
+
+        self.tracks = tracks
+        self.covers = covers
+        self._cover_pixmaps.clear()
+        self._cover_icons.clear()
         self.settings.setValue("library/path", folder)
         self.current_index = -1
         self._resort_and_populate()
+
+    def _on_scanner_finished(self):
+        self._scanner.deleteLater()
+        self._scanner = None
+        self.library_button.setEnabled(True)
+        self.library_button.setToolTip("Bibliothek wählen…")
+        self.search_edit.setPlaceholderText("Suchen…")
 
     def _resort_and_populate(self):
         """Bibliothek gemäß der gewählten Gruppierung neu sortieren und die Tabelle neu aufbauen."""
@@ -354,29 +402,35 @@ class PlayerWindow(QMainWindow):
         self._populate_playlist_table(self.group_by)
         self._update_controls()
 
-    def _on_search_changed(self, text: str):
-        self.search_query = text.strip()
+    def _on_search_changed(self):
+        self.search_query = self.search_edit.text().strip().lower()
         self._populate_playlist_table(self.group_by)
 
     def _populate_playlist_table(self, group_by):
-        table = self.playlist_table
-        table.setRowCount(0)
-        self.row_to_track = []
+        rows = []
         last_label = object()  # Platzhalter, damit die erste Gruppe immer eine Überschrift bekommt
-
         for track_index, track in enumerate(self.tracks):
             if not track_matches_search(track, self.search_query):
                 continue
             label = group_label(track, group_by)
             if label is not None and label != last_label:
-                self._add_group_header_row(label)
+                rows.append(label)
                 last_label = label
-            self._add_track_row(track, track_index)
+            rows.append(track_index)
+
+        table = self.playlist_table
+        table.setUpdatesEnabled(False)
+        try:
+            self.playlist_model.set_rows(self.tracks, rows)
+            table.clearSpans()
+            column_count = self.playlist_model.columnCount()
+            for row in self.playlist_model.header_rows():
+                table.setSpan(row, 0, 1, column_count)
+        finally:
+            table.setUpdatesEnabled(True)
 
         self.track_to_row = {
-            track_index: row
-            for row, track_index in enumerate(self.row_to_track)
-            if track_index is not None
+            entry: row for row, entry in enumerate(rows) if isinstance(entry, int)
         }
 
         if 0 <= self.current_index < len(self.tracks):
@@ -384,56 +438,38 @@ class PlayerWindow(QMainWindow):
             if table_row is not None:
                 table.selectRow(table_row)
 
-    def _add_group_header_row(self, label):
-        table = self.playlist_table
-        row = table.rowCount()
-        table.insertRow(row)
-        item = QTableWidgetItem(label)
-        font = item.font()
-        font.setBold(True)
-        item.setFont(font)
-        item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
-        item.setBackground(QColor(ELEVATED))
-        item.setForeground(QColor(TEXT_PRIMARY))
-        table.setItem(row, 0, item)
-        table.setSpan(row, 0, 1, table.columnCount())
-        self.row_to_track.append(None)
-
-    def _add_track_row(self, track, track_index):
-        table = self.playlist_table
-        row = table.rowCount()
-        table.insertRow(row)
-        cover_item = QTableWidgetItem()
-        icon = self._cover_icon(track["cover_data"])
-        if icon is not None:
-            cover_item.setIcon(icon)
-        table.setItem(row, 0, cover_item)
-        table.setItem(row, 1, QTableWidgetItem(track["title"]))
-        table.setItem(row, 2, QTableWidgetItem(track["artist"]))
-        table.setItem(row, 3, QTableWidgetItem(track["album"]))
-        table.setItem(row, 4, QTableWidgetItem(str(track["year"]) if track["year"] else ""))
-        self.row_to_track.append(track_index)
-
-    @staticmethod
-    def _cover_pixmap(cover_data, size):
-        if not cover_data:
+    def _cover_pixmap(self, cover_id, size):
+        """Skalierte Pixmap eines Covers (pro Cover und Größe nur einmal dekodiert)."""
+        if cover_id is None:
             return None
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(cover_data):
-            return None
-        return pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        key = (cover_id, size)
+        if key in self._cover_pixmaps:
+            return self._cover_pixmaps[key]
+        pixmap = None
+        data = self.covers.get(cover_id)
+        if data:
+            source = QPixmap()
+            if source.loadFromData(data):
+                ratio = self.devicePixelRatioF()
+                pixel_size = round(size * ratio)
+                pixmap = source.scaled(
+                    pixel_size, pixel_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                pixmap.setDevicePixelRatio(ratio)
+        self._cover_pixmaps[key] = pixmap
+        return pixmap
 
-    @classmethod
-    def _cover_icon(cls, cover_data):
-        pixmap = cls._cover_pixmap(cover_data, COVER_SIZE)
-        return QIcon(pixmap) if pixmap is not None else None
+    def _cover_icon(self, cover_id):
+        if cover_id not in self._cover_icons:
+            pixmap = self._cover_pixmap(cover_id, COVER_SIZE)
+            self._cover_icons[cover_id] = QIcon(pixmap) if pixmap is not None else None
+        return self._cover_icons[cover_id]
 
-    def _set_cover_art(self, cover_data):
-        pixmap = self._cover_pixmap(cover_data, PLAYER_COVER_SIZE)
+    def _set_cover_art(self, cover_id):
+        pixmap = self._cover_pixmap(cover_id, PLAYER_COVER_SIZE)
         self.cover_art_label.setPixmap(pixmap if pixmap is not None else QPixmap())
 
-    def _set_quality_badge(self, path):
-        badge = quality_badge_info(path)
+    def _set_quality_badge(self, badge):
         if badge is None:
             self.quality_badge.setVisible(False)
             self.quality_badge.setGraphicsEffect(None)
@@ -469,15 +505,13 @@ class PlayerWindow(QMainWindow):
 
         self.tracks = []
         self.current_index = -1
-        self.row_to_track = []
         self.track_to_row = {}
-        self.playlist_table.setRowCount(0)
+        self.playlist_model.set_rows(self.tracks, [])
+        self.playlist_table.clearSpans()
         self._load_and_play(path)
 
-    def _on_table_double_clicked(self, row: int, _column: int = 0):
-        if not (0 <= row < len(self.row_to_track)):
-            return
-        track_index = self.row_to_track[row]
+    def _on_table_double_clicked(self, index):
+        track_index = self.playlist_model.track_index_at(index.row())
         if track_index is not None:
             self.play_track(track_index)
 
@@ -522,16 +556,18 @@ class PlayerWindow(QMainWindow):
             track = self.tracks[self.current_index]
             title = track["title"]
             artist = track["artist"]
-            cover_data = track["cover_data"]
+            cover_id = track["cover_id"]
+            badge = track["badge"]
         else:
             title = QFileInfo(path).completeBaseName()
             artist = ""
-            cover_data = read_track(path)["cover_data"] if path.lower().endswith(".flac") else None
+            cover_id = read_track(path, self.covers)["cover_id"] if path.lower().endswith(".flac") else None
+            badge = quality_badge_info(path)
         self.now_playing_title.setText(title)
         self.now_playing_artist.setText(artist)
         self.setWindowTitle(f"{title} – FloPlayer")
-        self._set_cover_art(cover_data)
-        self._set_quality_badge(path)
+        self._set_cover_art(cover_id)
+        self._set_quality_badge(badge)
         self.player.play()
 
     def toggle_play(self):
@@ -554,7 +590,11 @@ class PlayerWindow(QMainWindow):
     def on_position_changed(self, position: int):
         if not self._seeking:
             self.position_slider.setValue(position)
-        self.time_current.setText(format_ms(position))
+            # Label nur neu setzen, wenn sich die angezeigte Sekunde ändert
+            position_s = position // 1000
+            if position_s != self._last_position_s:
+                self._last_position_s = position_s
+                self.time_current.setText(format_ms(position))
 
     def on_duration_changed(self, duration: int):
         self.position_slider.setRange(0, duration)
@@ -602,6 +642,7 @@ class PlayerWindow(QMainWindow):
         self._seeking = True
 
     def _on_slider_moved(self, value: int):
+        self._last_position_s = -1
         self.time_current.setText(format_ms(value))
 
     def _on_slider_released(self):
